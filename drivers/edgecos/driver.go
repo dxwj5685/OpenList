@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
@@ -86,12 +87,20 @@ func (d *EdgeCOS) MakeDir(ctx context.Context, parentDir model.Obj, dirName stri
 }
 
 func (d *EdgeCOS) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
-	// targetPath is the full destination path (directory + filename)
-	targetPath := d.getFullPath(dstDir, srcObj.GetName())
+	// move uses source path and target directory (not IDs)
+	sourcePath := srcObj.GetPath()
+	targetPath := dstDir.GetPath()
+	if targetPath == "" {
+		targetPath = "/"
+	}
+	// targetPath should be a directory (ensure trailing slash)
+	if !strings.HasSuffix(targetPath, "/") {
+		targetPath += "/"
+	}
 
-	_, err := d.request(baseURL+"/batch/move", http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(baseURL+"/move", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
-			"ids":        []string{srcObj.GetID()},
+			"sourcePath": sourcePath,
 			"targetPath": targetPath,
 		})
 	}, nil)
@@ -121,12 +130,20 @@ func (d *EdgeCOS) Rename(ctx context.Context, srcObj model.Obj, newName string) 
 }
 
 func (d *EdgeCOS) Copy(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
-	// targetPath is the full destination path (directory + filename)
-	targetPath := d.getFullPath(dstDir, srcObj.GetName())
+	// copy uses source path and target directory (not IDs)
+	sourcePath := srcObj.GetPath()
+	targetPath := dstDir.GetPath()
+	if targetPath == "" {
+		targetPath = "/"
+	}
+	// targetPath should be a directory (ensure trailing slash)
+	if !strings.HasSuffix(targetPath, "/") {
+		targetPath += "/"
+	}
 
-	_, err := d.request(baseURL+"/batch/copy", http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(baseURL+"/copy", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
-			"ids":        []string{srcObj.GetID()},
+			"sourcePath": sourcePath,
 			"targetPath": targetPath,
 		})
 	}, nil)
@@ -135,9 +152,10 @@ func (d *EdgeCOS) Copy(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj
 }
 
 func (d *EdgeCOS) Remove(ctx context.Context, obj model.Obj) error {
-	_, err := d.request(baseURL+"/batch/delete", http.MethodPost, func(req *resty.Request) {
+	// delete uses a single id (not an array)
+	_, err := d.request(baseURL+"/delete", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
-			"ids": []string{obj.GetID()},
+			"id": obj.GetID(),
 		})
 	}, nil)
 
