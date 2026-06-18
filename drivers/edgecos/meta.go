@@ -16,7 +16,7 @@ type Addition struct {
 var config = driver.Config{
 	Name:              "EdgeCOS",
 	LocalSort:         false,
-	OnlyProxy:         false,
+	OnlyProxy:         true,
 	NoCache:           false,
 	NoUpload:          false,
 	NeedMs:            false,
