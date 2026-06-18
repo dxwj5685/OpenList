@@ -57,6 +57,7 @@ func fileToObj(f File) model.Obj {
 		Size:     f.GetSize(),
 		Modified: f.LastMod,
 		IsFolder: f.Type == "directory",
+		Path:     f.Filename, // Filename is the full path
 	}
 }
 
