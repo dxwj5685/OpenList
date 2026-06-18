@@ -15,6 +15,7 @@ type File struct {
 	Type         string      `json:"type"`
 	Thumbnail    *string     `json:"thumbnail"`
 	HasThumbnail bool        `json:"hasThumbnail"`
+	FullPath     string      `json:"-"` // Constructed full path, not from API
 }
 
 func (f File) GetSize() int64 {

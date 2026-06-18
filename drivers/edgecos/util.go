@@ -47,6 +47,12 @@ func (d *EdgeCOS) getFiles(dirPath string) ([]File, error) {
 	_, err := d.request(baseURL+"/files", http.MethodGet, func(req *resty.Request) {
 		req.SetQueryParam("path", dirPath)
 	}, &files)
+
+	// Construct full path for each file
+	for i := range files {
+		files[i].FullPath = path.Join(dirPath, files[i].Basename)
+	}
+
 	return files, err
 }
 
@@ -57,7 +63,7 @@ func fileToObj(f File) model.Obj {
 		Size:     f.GetSize(),
 		Modified: f.LastMod,
 		IsFolder: f.Type == "directory",
-		Path:     f.Filename, // Filename is the full path
+		Path:     f.FullPath, // Use constructed full path
 	}
 }
 

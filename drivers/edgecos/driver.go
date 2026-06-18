@@ -56,8 +56,8 @@ func (d *EdgeCOS) List(ctx context.Context, dir model.Obj, args model.ListArgs) 
 }
 
 func (d *EdgeCOS) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	// Direct download link
-	url := fmt.Sprintf("%s/download?fileId=%s", baseURL, file.GetID())
+	// EdgeCOS download uses file path, not fileId
+	url := fmt.Sprintf("%s/download?path=%s", baseURL, file.GetPath())
 	return &model.Link{
 		URL: url,
 		Header: http.Header{
