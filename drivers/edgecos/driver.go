@@ -467,18 +467,18 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 }
 
 func (d *EdgeCOS) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
-	var quota UserQuota
-	_, err := d.request(baseURL+"/user/quota", http.MethodGet, nil, &quota)
+	var myPlan MyPlan
+	_, err := d.request(baseURL+"/my-plan", http.MethodGet, nil, &myPlan)
 	if err != nil {
 		return nil, err
 	}
 
-	total, err := strconv.ParseInt(quota.Quota, 10, 64)
+	total, err := strconv.ParseInt(myPlan.Quota, 10, 64)
 	if err != nil {
 		return nil, err
 	}
 
-	used, err := strconv.ParseInt(quota.Used, 10, 64)
+	used, err := strconv.ParseInt(myPlan.Used, 10, 64)
 	if err != nil {
 		return nil, err
 	}

@@ -31,7 +31,7 @@ type LoginResp struct {
 	} `json:"user"`
 }
 
-type UserQuota struct {
+type MyPlan struct {
 	Quota string `json:"quota"`
 	Used  string `json:"used"`
 }
