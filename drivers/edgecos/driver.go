@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,10 +57,10 @@ func (d *EdgeCOS) List(ctx context.Context, dir model.Obj, args model.ListArgs) 
 }
 
 func (d *EdgeCOS) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	// EdgeCOS download uses file path, not fileId
-	url := fmt.Sprintf("%s/download?path=%s", baseURL, file.GetPath())
+	// EdgeCOS download uses file path
+	downloadURL := fmt.Sprintf("%s/download?path=%s", baseURL, url.QueryEscape(file.GetPath()))
 	return &model.Link{
-		URL: url,
+		URL: downloadURL,
 		Header: http.Header{
 			"Cookie": []string{fmt.Sprintf("token=%s", d.token)},
 		},
