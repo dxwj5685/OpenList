@@ -184,7 +184,7 @@ func (d *EdgeCOS) putSmallFile(ctx context.Context, dirPath, fileName string, fi
 		return nil, fmt.Errorf("failed to cache stream: %w", err)
 	}
 
-	// Calculate SHA256 hash
+	// Calculate SHA256 hash in EdgeCOS format: sha256:<hex>:<filesize>
 	hash := sha256.New()
 	if _, err := cachedFile.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("seek failed: %w", err)
@@ -192,7 +192,7 @@ func (d *EdgeCOS) putSmallFile(ctx context.Context, dirPath, fileName string, fi
 	if _, err := io.Copy(hash, cachedFile); err != nil {
 		return nil, fmt.Errorf("hash calculation failed: %w", err)
 	}
-	hashStr := hex.EncodeToString(hash.Sum(nil))
+	hashStr := "sha256:" + hex.EncodeToString(hash.Sum(nil)) + ":" + strconv.FormatInt(fileSize, 10)
 
 	// Reset for upload
 	if _, err := cachedFile.Seek(0, io.SeekStart); err != nil {
@@ -322,7 +322,7 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 		return nil, fmt.Errorf("failed to cache stream: %w", err)
 	}
 
-	// Calculate SHA256 hash
+	// Calculate SHA256 hash in EdgeCOS format: sha256:<hex>:<filesize>
 	hash := sha256.New()
 	if _, err := cacheFile.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("seek failed: %w", err)
@@ -330,7 +330,7 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 	if _, err := io.Copy(hash, cacheFile); err != nil {
 		return nil, fmt.Errorf("hash calculation failed: %w", err)
 	}
-	hashStr := hex.EncodeToString(hash.Sum(nil))
+	hashStr := "sha256:" + hex.EncodeToString(hash.Sum(nil)) + ":" + strconv.FormatInt(fileSize, 10)
 
 	// Reset for part uploads
 	if _, err := cacheFile.Seek(0, io.SeekStart); err != nil {
