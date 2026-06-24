@@ -2,6 +2,8 @@ package edgecos
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"math"
@@ -88,13 +90,11 @@ func (d *EdgeCOS) MakeDir(ctx context.Context, parentDir model.Obj, dirName stri
 }
 
 func (d *EdgeCOS) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
-	// move uses source path and target directory (not IDs)
 	sourcePath := srcObj.GetPath()
 	targetPath := dstDir.GetPath()
 	if targetPath == "" {
 		targetPath = "/"
 	}
-	// targetPath should be a directory (ensure trailing slash)
 	if !strings.HasSuffix(targetPath, "/") {
 		targetPath += "/"
 	}
@@ -131,13 +131,11 @@ func (d *EdgeCOS) Rename(ctx context.Context, srcObj model.Obj, newName string) 
 }
 
 func (d *EdgeCOS) Copy(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
-	// copy uses source path and target directory (not IDs)
 	sourcePath := srcObj.GetPath()
 	targetPath := dstDir.GetPath()
 	if targetPath == "" {
 		targetPath = "/"
 	}
-	// targetPath should be a directory (ensure trailing slash)
 	if !strings.HasSuffix(targetPath, "/") {
 		targetPath += "/"
 	}
@@ -153,7 +151,6 @@ func (d *EdgeCOS) Copy(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj
 }
 
 func (d *EdgeCOS) Remove(ctx context.Context, obj model.Obj) error {
-	// delete uses a single id (not an array)
 	_, err := d.request(baseURL+"/delete", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"id": obj.GetID(),
@@ -172,25 +169,44 @@ func (d *EdgeCOS) Put(ctx context.Context, dstDir model.Obj, streamer model.File
 	fileSize := streamer.GetSize()
 	fileName := streamer.GetName()
 
-	// Small file upload (< 100MB)
 	const maxSmallFileSize = 100 * 1024 * 1024
 	if fileSize < maxSmallFileSize {
 		return d.putSmallFile(ctx, dirPath, fileName, fileSize, streamer, up)
 	}
 
-	// Large file multipart upload (>= 100MB)
 	return d.putLargeFile(ctx, dirPath, fileName, fileSize, streamer, up)
 }
 
 func (d *EdgeCOS) putSmallFile(ctx context.Context, dirPath, fileName string, fileSize int64, streamer model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
-	// Get upload token
+	// EdgeCOS requires SHA256 hash. Cache stream to calculate.
+	cachedFile, err := streamer.CacheFullAndWriter(nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to cache stream: %w", err)
+	}
+
+	// Calculate SHA256 hash
+	hash := sha256.New()
+	if _, err := cachedFile.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek failed: %w", err)
+	}
+	if _, err := io.Copy(hash, cachedFile); err != nil {
+		return nil, fmt.Errorf("hash calculation failed: %w", err)
+	}
+	hashStr := hex.EncodeToString(hash.Sum(nil))
+
+	// Reset for upload
+	if _, err := cachedFile.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek failed: %w", err)
+	}
+
+	// Get upload token with SHA256 hash
 	var tokenResp UploadTokenResp
-	_, err := d.request(baseURL+"/upload/token", http.MethodGet, func(req *resty.Request) {
+	_, err = d.request(baseURL+"/upload/token", http.MethodGet, func(req *resty.Request) {
 		req.SetQueryParams(map[string]string{
 			"filename": fileName,
 			"filesize": strconv.FormatInt(fileSize, 10),
 			"path":     dirPath,
-			"hash":     "",
+			"hash":     hashStr,
 		})
 	}, &tokenResp)
 
@@ -198,7 +214,6 @@ func (d *EdgeCOS) putSmallFile(ctx context.Context, dirPath, fileName string, fi
 		return nil, err
 	}
 
-	// Check for quick upload (file already exists)
 	if tokenResp.QuickUpload {
 		up(100)
 		return &model.Object{
@@ -208,13 +223,11 @@ func (d *EdgeCOS) putSmallFile(ctx context.Context, dirPath, fileName string, fi
 		}, nil
 	}
 
-	// Upload file to presigned URL
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, tokenResp.URL, streamer)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, tokenResp.URL, cachedFile)
 	if err != nil {
 		return nil, err
 	}
 
-	// EdgeCOS presigned URLs expect application/octet-stream
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.ContentLength = fileSize
 
@@ -231,14 +244,14 @@ func (d *EdgeCOS) putSmallFile(ctx context.Context, dirPath, fileName string, fi
 
 	up(90)
 
-	// Complete upload
+	// Complete with SHA256 hash
 	_, err = d.request(baseURL+"/upload/complete", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"key":      tokenResp.Key,
 			"filename": fileName,
 			"path":     dirPath,
 			"size":     fileSize,
-			"hash":     "",
+			"hash":     hashStr,
 		})
 	}, nil)
 
@@ -256,7 +269,6 @@ func (d *EdgeCOS) putSmallFile(ctx context.Context, dirPath, fileName string, fi
 }
 
 func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fileSize int64, streamer model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
-	// Initialize multipart upload
 	var initResp MultipartInitResp
 	_, err := d.request(baseURL+"/upload/multipart/init", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
@@ -271,7 +283,6 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 		return nil, err
 	}
 
-	// Check for quick upload
 	if initResp.QuickUpload {
 		up(100)
 		return &model.Object{
@@ -281,14 +292,13 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 		}, nil
 	}
 
-	// Use configured chunk size or default to 10MB
+	// Use configured chunk size (default 16MB)
 	partSize := d.ChunkSize
 	if partSize <= 0 {
-		partSize = 10 * 1024 * 1024
+		partSize = 16 * 1024 * 1024
 	}
 	partCount := int(math.Ceil(float64(fileSize) / float64(partSize)))
 
-	// Get upload URLs for all parts
 	partNumbers := make([]int, partCount)
 	for i := 0; i < partCount; i++ {
 		partNumbers[i] = i + 1
@@ -307,15 +317,26 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 		return nil, err
 	}
 
-	// Cache the full stream so parts can be read concurrently via ReadAt.
-	// A stream is sequential and cannot be read concurrently, so we must
-	// cache it to a seekable File first.
 	cacheFile, err := streamer.CacheFullAndWriter(nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to cache stream: %w", err)
 	}
 
-	// Upload parts with concurrency
+	// Calculate SHA256 hash
+	hash := sha256.New()
+	if _, err := cacheFile.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek failed: %w", err)
+	}
+	if _, err := io.Copy(hash, cacheFile); err != nil {
+		return nil, fmt.Errorf("hash calculation failed: %w", err)
+	}
+	hashStr := hex.EncodeToString(hash.Sum(nil))
+
+	// Reset for part uploads
+	if _, err := cacheFile.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek failed: %w", err)
+	}
+
 	uploadThread := d.UploadThread
 	if uploadThread <= 0 {
 		uploadThread = 3
@@ -324,7 +345,6 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 		uploadThread = partCount
 	}
 
-	// Channel for part upload tasks
 	type partTask struct {
 		partNum int
 		offset  int64
@@ -335,11 +355,9 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 	errCh := make(chan error, partCount)
 	var wg sync.WaitGroup
 
-	// Progress tracking
 	uploadedParts := make([]bool, partCount)
 	var progressMu sync.Mutex
 
-	// Worker goroutines
 	for w := 0; w < uploadThread; w++ {
 		wg.Add(1)
 		go func() {
@@ -356,9 +374,6 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 					return
 				}
 
-				// Read this part's data from the cached file at the given offset.
-				// io.SectionReader is safe for concurrent use since each worker
-				// gets its own SectionReader over the shared ReaderAt.
 				sectionReader := io.NewSectionReader(cacheFile, task.offset, task.size)
 
 				req, err := http.NewRequestWithContext(ctx, http.MethodPut, partURL, sectionReader)
@@ -382,7 +397,6 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 					return
 				}
 
-				// Update progress
 				progressMu.Lock()
 				uploadedParts[task.partNum-1] = true
 				uploaded := 0
@@ -398,7 +412,6 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 		}()
 	}
 
-	// Send tasks to workers
 	go func() {
 		for i := 1; i <= partCount; i++ {
 			offset := int64(i-1) * partSize
@@ -416,22 +429,18 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 		close(tasks)
 	}()
 
-	// Wait for all uploads to complete
 	wg.Wait()
 	close(errCh)
 
-	// Collect all errors from the channel
 	var uploadErrors []error
 	for err := range errCh {
 		uploadErrors = append(uploadErrors, err)
 	}
 
-	// Return the first error if any occurred
 	if len(uploadErrors) > 0 {
 		return nil, uploadErrors[0]
 	}
 
-	// Complete multipart upload
 	_, err = d.request(baseURL+"/upload/multipart/complete", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"uploadId": initResp.UploadID,
@@ -443,14 +452,14 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 		return nil, err
 	}
 
-	// Final complete
+	// Final complete with SHA256 hash
 	_, err = d.request(baseURL+"/upload/complete", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"key":      initResp.Key,
 			"filename": fileName,
 			"path":     dirPath,
 			"size":     fileSize,
-			"hash":     "",
+			"hash":     hashStr,
 		})
 	}, nil)
 
