@@ -9,7 +9,8 @@ type Addition struct {
 	driver.RootPath
 	Username     string `json:"username" required:"true"`
 	Password     string `json:"password" required:"true"`
-	ChunkSize    int64  `json:"chunk_size" type:"number" default:"16777216" help:"Chunk size for multipart upload (in bytes, default 16MB)"`
+	DownloadLine string `json:"download_line" type:"select" options:"cdn,free" default:"cdn" help:"Download line used by the EdgeCOS file API"`
+	ChunkSize    int64  `json:"chunk_size" type:"number" default:"104857600" help:"Chunk size for multipart upload (in bytes, default 100MB)"`
 	UploadThread int    `json:"upload_thread" type:"number" default:"3" help:"Concurrent upload threads for large files"`
 }
 

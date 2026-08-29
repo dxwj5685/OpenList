@@ -4,11 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
-	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,26 +43,18 @@ func (d *EdgeCOS) Drop(ctx context.Context) error {
 }
 
 func (d *EdgeCOS) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
-	dirPath := dir.GetPath()
-	if dirPath == "" || dirPath == "root" {
-		dirPath = "/"
-	}
-
-	files, err := d.getFiles(dirPath)
+	files, err := d.getFiles(dir.GetPath())
 	if err != nil {
 		return nil, err
 	}
-
 	return utils.SliceConvert(files, func(src File) (model.Obj, error) {
 		return fileToObj(src), nil
 	})
 }
 
 func (d *EdgeCOS) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
-	// EdgeCOS download uses file path
-	downloadURL := fmt.Sprintf("%s/download?path=%s", baseURL, url.QueryEscape(file.GetPath()))
 	return &model.Link{
-		URL: downloadURL,
+		URL: d.downloadURL(file),
 		Header: http.Header{
 			"Cookie": []string{fmt.Sprintf("token=%s", d.token)},
 		},
@@ -71,272 +63,206 @@ func (d *EdgeCOS) Link(ctx context.Context, file model.Obj, args model.LinkArgs)
 
 func (d *EdgeCOS) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
 	fullPath := d.getFullPath(parentDir, dirName)
-
 	_, err := d.request(baseURL+"/mkdir", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(base.Json{
-			"path": fullPath,
-		})
+		req.SetBody(base.Json{"path": fullPath})
 	}, nil)
-
 	if err != nil {
 		return nil, err
 	}
-
-	return &model.Object{
-		Name:     dirName,
-		Path:     fullPath,
-		IsFolder: true,
-	}, nil
+	return &model.Object{Name: dirName, Path: fullPath, IsFolder: true}, nil
 }
 
 func (d *EdgeCOS) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
-	sourcePath := srcObj.GetPath()
-	targetPath := dstDir.GetPath()
-	if targetPath == "" {
-		targetPath = "/"
-	}
-	if !strings.HasSuffix(targetPath, "/") {
-		targetPath += "/"
-	}
-
 	_, err := d.request(baseURL+"/move", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(base.Json{
-			"sourcePath": sourcePath,
-			"targetPath": targetPath,
-		})
+		req.SetBody(transferPayload(srcObj, dstDir))
 	}, nil)
-
 	return srcObj, err
 }
 
 func (d *EdgeCOS) Rename(ctx context.Context, srcObj model.Obj, newName string) (model.Obj, error) {
+	payload := objectPayload(srcObj, "id", "oldPath")
+	payload["newName"] = newName
 	_, err := d.request(baseURL+"/rename", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(base.Json{
-			"id":      srcObj.GetID(),
-			"newName": newName,
-		})
+		req.SetBody(payload)
 	}, nil)
-
 	if err != nil {
 		return nil, err
 	}
-
 	return &model.Object{
 		ID:       srcObj.GetID(),
 		Name:     newName,
 		Size:     srcObj.GetSize(),
 		Modified: srcObj.ModTime(),
 		IsFolder: srcObj.IsDir(),
+		Path:     normalizePath(path.Join(path.Dir(srcObj.GetPath()), newName)),
 	}, nil
 }
 
 func (d *EdgeCOS) Copy(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
-	sourcePath := srcObj.GetPath()
-	targetPath := dstDir.GetPath()
-	if targetPath == "" {
-		targetPath = "/"
-	}
-	if !strings.HasSuffix(targetPath, "/") {
-		targetPath += "/"
-	}
-
 	_, err := d.request(baseURL+"/copy", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(base.Json{
-			"sourcePath": sourcePath,
-			"targetPath": targetPath,
-		})
+		req.SetBody(transferPayload(srcObj, dstDir))
 	}, nil)
-
 	return srcObj, err
 }
 
 func (d *EdgeCOS) Remove(ctx context.Context, obj model.Obj) error {
 	_, err := d.request(baseURL+"/delete", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(base.Json{
-			"id": obj.GetID(),
-		})
+		req.SetBody(objectPayload(obj, "id", "path"))
 	}, nil)
-
 	return err
 }
 
 func (d *EdgeCOS) Put(ctx context.Context, dstDir model.Obj, streamer model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
-	dirPath := dstDir.GetPath()
-	if dirPath == "" || dirPath == "root" {
-		dirPath = "/"
-	}
-
 	fileSize := streamer.GetSize()
-	fileName := streamer.GetName()
-
-	const maxSmallFileSize = 100 * 1024 * 1024
-	if fileSize < maxSmallFileSize {
-		return d.putSmallFile(ctx, dirPath, fileName, fileSize, streamer, up)
+	if fileSize <= 0 || fileSize > maxUploadFileSize {
+		return nil, fmt.Errorf("invalid file size %d: EdgeCOS accepts files between 1 byte and 100GB", fileSize)
 	}
 
-	return d.putLargeFile(ctx, dirPath, fileName, fileSize, streamer, up)
+	dirPath := normalizePath(dstDir.GetPath())
+	fileName := streamer.GetName()
+	cachedFile, hashValue, err := cacheAndHash(streamer, fileSize)
+	if err != nil {
+		return nil, err
+	}
+	if closer, ok := cachedFile.(io.Closer); ok {
+		defer closer.Close()
+	}
+
+	overwrite := streamer.GetExist() != nil
+	if fileSize <= defaultMultipartPartSize {
+		return d.putSmallFile(ctx, dirPath, fileName, fileSize, hashValue, overwrite, streamer.GetMimetype(), cachedFile, up)
+	}
+	return d.putLargeFile(ctx, dirPath, fileName, fileSize, hashValue, overwrite, cachedFile, up)
 }
 
-func (d *EdgeCOS) putSmallFile(ctx context.Context, dirPath, fileName string, fileSize int64, streamer model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
-	// EdgeCOS requires SHA256 hash. Cache stream to calculate.
+func cacheAndHash(streamer model.FileStreamer, fileSize int64) (model.File, string, error) {
 	cachedFile, err := streamer.CacheFullAndWriter(nil, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to cache stream: %w", err)
+		return nil, "", fmt.Errorf("failed to cache stream: %w", err)
 	}
-
-	// Calculate SHA256 hash in EdgeCOS format: sha256:<hex>:<filesize>
+	if _, err := cachedFile.Seek(0, io.SeekStart); err != nil {
+		return nil, "", fmt.Errorf("seek failed: %w", err)
+	}
 	hash := sha256.New()
-	if _, err := cachedFile.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek failed: %w", err)
-	}
 	if _, err := io.Copy(hash, cachedFile); err != nil {
-		return nil, fmt.Errorf("hash calculation failed: %w", err)
+		return nil, "", fmt.Errorf("hash calculation failed: %w", err)
 	}
-	hashStr := "sha256:" + hex.EncodeToString(hash.Sum(nil)) + ":" + strconv.FormatInt(fileSize, 10)
-
-	// Reset for upload
 	if _, err := cachedFile.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek failed: %w", err)
+		return nil, "", fmt.Errorf("seek failed: %w", err)
 	}
-
-	// Get upload token with SHA256 hash
-	var tokenResp UploadTokenResp
-	_, err = d.request(baseURL+"/upload/token", http.MethodGet, func(req *resty.Request) {
-		req.SetQueryParams(map[string]string{
-			"filename": fileName,
-			"filesize": strconv.FormatInt(fileSize, 10),
-			"path":     dirPath,
-			"hash":     hashStr,
-		})
-	}, &tokenResp)
-
-	if err != nil {
-		return nil, err
-	}
-
-	if tokenResp.QuickUpload {
-		up(100)
-		return &model.Object{
-			Name: fileName,
-			Size: fileSize,
-			Path: dirPath + "/" + fileName,
-		}, nil
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, tokenResp.URL, cachedFile)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = fileSize
-
-	resp, err := base.HttpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("upload failed: %s", string(body))
-	}
-
-	up(90)
-
-	// Complete with SHA256 hash
-	_, err = d.request(baseURL+"/upload/complete", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(base.Json{
-			"key":      tokenResp.Key,
-			"filename": fileName,
-			"path":     dirPath,
-			"size":     fileSize,
-			"hash":     hashStr,
-		})
-	}, nil)
-
-	if err != nil {
-		return nil, err
-	}
-
-	up(100)
-
-	return &model.Object{
-		Name: fileName,
-		Size: fileSize,
-		Path: dirPath + "/" + fileName,
-	}, nil
+	return cachedFile, "sha256:" + hex.EncodeToString(hash.Sum(nil)) + ":" + strconv.FormatInt(fileSize, 10), nil
 }
 
-func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fileSize int64, streamer model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
-	var initResp MultipartInitResp
-	_, err := d.request(baseURL+"/upload/multipart/init", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(base.Json{
-			"filename": fileName,
-			"filesize": fileSize,
-			"path":     dirPath,
-			"hash":     "",
-		})
-	}, &initResp)
-
+func (d *EdgeCOS) putSmallFile(ctx context.Context, dirPath, fileName string, fileSize int64, hashValue string, overwrite bool, mimeType string, cachedFile model.File, up driver.UpdateProgress) (model.Obj, error) {
+	metadata := uploadMetadata(fileName, dirPath, fileSize, hashValue, overwrite)
+	tokenResp, err := d.getUploadToken(fileName, dirPath, fileSize, hashValue, overwrite, false)
 	if err != nil {
 		return nil, err
 	}
+	if tokenResp.IsInstant() {
+		completeResp, completeErr := d.completeInstant(tokenResp.Key, metadata)
+		if completeErr == nil {
+			up(100)
+			return uploadedObject(fileName, dirPath, fileSize, completeResp), nil
+		}
+		if !isInstantMiss(completeErr) {
+			return nil, completeErr
+		}
+		tokenResp, err = d.getUploadToken(fileName, dirPath, fileSize, hashValue, overwrite, true)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if tokenResp.URL == "" {
+		return nil, errors.New("edgecos upload token did not include an upload URL")
+	}
+	if _, err := cachedFile.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek failed: %w", err)
+	}
+	method := strings.ToUpper(strings.TrimSpace(tokenResp.Method))
+	if method == "" {
+		method = http.MethodPut
+	}
+	req, err := http.NewRequestWithContext(ctx, method, tokenResp.URL, cachedFile)
+	if err != nil {
+		return nil, err
+	}
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	req.Header.Set("Content-Type", mimeType)
+	req.ContentLength = fileSize
+	if err := executeUploadRequest(req); err != nil {
+		return nil, err
+	}
+	up(90)
 
-	if initResp.QuickUpload {
-		up(100)
-		return &model.Object{
-			Name: fileName,
-			Size: fileSize,
-			Path: dirPath + "/" + fileName,
-		}, nil
+	metadata["key"] = tokenResp.Key
+	var completeResp UploadCompleteResp
+	_, err = d.request(baseURL+"/upload/complete", http.MethodPost, func(req *resty.Request) {
+		req.SetBody(metadata)
+	}, &completeResp)
+	if err != nil {
+		return nil, err
+	}
+	up(100)
+	return uploadedObject(fileName, dirPath, fileSize, completeResp), nil
+}
+
+func (d *EdgeCOS) getUploadToken(fileName, dirPath string, fileSize int64, hashValue string, overwrite, skipInstant bool) (UploadTokenResp, error) {
+	params := map[string]string{
+		"filename":  fileName,
+		"filesize":  strconv.FormatInt(fileSize, 10),
+		"path":      normalizePath(dirPath),
+		"hash":      hashValue,
+		"overwrite": strconv.FormatBool(overwrite),
+	}
+	if skipInstant {
+		params["skipInstant"] = "true"
+	}
+	var tokenResp UploadTokenResp
+	_, err := d.request(baseURL+"/upload/token", http.MethodGet, func(req *resty.Request) {
+		req.SetQueryParams(params)
+	}, &tokenResp)
+	return tokenResp, err
+}
+
+func (d *EdgeCOS) completeInstant(key string, metadata base.Json) (UploadCompleteResp, error) {
+	payload := cloneJSON(metadata)
+	payload["key"] = key
+	var completeResp UploadCompleteResp
+	_, err := d.request(baseURL+"/upload/instant-complete", http.MethodPost, func(req *resty.Request) {
+		req.SetBody(payload)
+	}, &completeResp)
+	return completeResp, err
+}
+
+func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fileSize int64, hashValue string, overwrite bool, cachedFile model.File, up driver.UpdateProgress) (model.Obj, error) {
+	metadata := uploadMetadata(fileName, dirPath, fileSize, hashValue, overwrite)
+	initResp, err := d.initMultipart(fileName, dirPath, fileSize, hashValue, overwrite, false)
+	if err != nil {
+		return nil, err
+	}
+	if initResp.IsInstant() {
+		completeResp, completeErr := d.completeInstant(initResp.Key, metadata)
+		if completeErr == nil {
+			up(100)
+			return uploadedObject(fileName, dirPath, fileSize, completeResp), nil
+		}
+		if !isInstantMiss(completeErr) {
+			return nil, completeErr
+		}
+		initResp, err = d.initMultipart(fileName, dirPath, fileSize, hashValue, overwrite, true)
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	// Use configured chunk size (default 16MB)
 	partSize := d.ChunkSize
 	if partSize <= 0 {
-		partSize = 16 * 1024 * 1024
+		partSize = defaultMultipartPartSize
 	}
-	partCount := int(math.Ceil(float64(fileSize) / float64(partSize)))
-
-	partNumbers := make([]int, partCount)
-	for i := 0; i < partCount; i++ {
-		partNumbers[i] = i + 1
-	}
-
-	var urlsResp MultipartURLsResp
-	_, err = d.request(baseURL+"/upload/multipart/urls", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(base.Json{
-			"uploadId":    initResp.UploadID,
-			"key":         initResp.Key,
-			"partNumbers": partNumbers,
-		})
-	}, &urlsResp)
-
-	if err != nil {
-		return nil, err
-	}
-
-	cacheFile, err := streamer.CacheFullAndWriter(nil, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to cache stream: %w", err)
-	}
-
-	// Calculate SHA256 hash in EdgeCOS format: sha256:<hex>:<filesize>
-	hash := sha256.New()
-	if _, err := cacheFile.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek failed: %w", err)
-	}
-	if _, err := io.Copy(hash, cacheFile); err != nil {
-		return nil, fmt.Errorf("hash calculation failed: %w", err)
-	}
-	hashStr := "sha256:" + hex.EncodeToString(hash.Sum(nil)) + ":" + strconv.FormatInt(fileSize, 10)
-
-	// Reset for part uploads
-	if _, err := cacheFile.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seek failed: %w", err)
-	}
-
+	partCount := int((fileSize + partSize - 1) / partSize)
 	uploadThread := d.UploadThread
 	if uploadThread <= 0 {
 		uploadThread = 3
@@ -346,19 +272,17 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 	}
 
 	type partTask struct {
-		partNum int
-		offset  int64
-		size    int64
+		number int
+		offset int64
+		size   int64
 	}
-
 	tasks := make(chan partTask, partCount)
 	errCh := make(chan error, partCount)
 	var wg sync.WaitGroup
-
-	uploadedParts := make([]bool, partCount)
 	var progressMu sync.Mutex
+	var uploadedBytes int64
 
-	for w := 0; w < uploadThread; w++ {
+	for worker := 0; worker < uploadThread; worker++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -367,137 +291,145 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 					errCh <- ctx.Err()
 					return
 				}
-
-				partURL := urlsResp.URLs[strconv.Itoa(task.partNum)]
-				if partURL == "" {
-					errCh <- fmt.Errorf("missing upload URL for part %d", task.partNum)
-					return
-				}
-
-				sectionReader := io.NewSectionReader(cacheFile, task.offset, task.size)
-
-				req, err := http.NewRequestWithContext(ctx, http.MethodPut, partURL, sectionReader)
+				partURL, err := d.getMultipartURL(initResp.UploadID, initResp.Key, task.number)
 				if err != nil {
 					errCh <- err
 					return
 				}
-
+				reader := io.NewSectionReader(cachedFile, task.offset, task.size)
+				req, err := http.NewRequestWithContext(ctx, http.MethodPut, partURL, reader)
+				if err != nil {
+					errCh <- err
+					return
+				}
 				req.Header.Set("Content-Type", "application/octet-stream")
 				req.ContentLength = task.size
-
-				resp, err := base.HttpClient.Do(req)
-				if err != nil {
-					errCh <- err
+				if err := executeUploadRequest(req); err != nil {
+					errCh <- fmt.Errorf("part %d upload failed: %w", task.number, err)
 					return
 				}
-				resp.Body.Close()
-
-				if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-					errCh <- fmt.Errorf("part %d upload failed with status %d", task.partNum, resp.StatusCode)
-					return
-				}
-
 				progressMu.Lock()
-				uploadedParts[task.partNum-1] = true
-				uploaded := 0
-				for _, done := range uploadedParts {
-					if done {
-						uploaded++
-					}
-				}
-				progress := float64(uploaded) * 90 / float64(partCount)
-				up(progress)
+				uploadedBytes += task.size
+				up(float64(uploadedBytes) * 90 / float64(fileSize))
 				progressMu.Unlock()
 			}
 		}()
 	}
 
-	go func() {
-		for i := 1; i <= partCount; i++ {
-			offset := int64(i-1) * partSize
-			currentPartSize := partSize
-			if i == partCount {
-				currentPartSize = fileSize - offset
-			}
-
-			tasks <- partTask{
-				partNum: i,
-				offset:  offset,
-				size:    currentPartSize,
-			}
+	for partNumber := 1; partNumber <= partCount; partNumber++ {
+		offset := int64(partNumber-1) * partSize
+		currentSize := partSize
+		if remaining := fileSize - offset; remaining < currentSize {
+			currentSize = remaining
 		}
-		close(tasks)
-	}()
-
+		tasks <- partTask{number: partNumber, offset: offset, size: currentSize}
+	}
+	close(tasks)
 	wg.Wait()
 	close(errCh)
 
-	var uploadErrors []error
-	for err := range errCh {
-		uploadErrors = append(uploadErrors, err)
+	for uploadErr := range errCh {
+		d.abortMultipart(initResp.UploadID, initResp.Key)
+		return nil, uploadErr
 	}
 
-	if len(uploadErrors) > 0 {
-		return nil, uploadErrors[0]
-	}
-
+	payload := cloneJSON(metadata)
+	payload["uploadId"] = initResp.UploadID
+	payload["key"] = initResp.Key
+	var completeResp UploadCompleteResp
 	_, err = d.request(baseURL+"/upload/multipart/complete", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(base.Json{
-			"uploadId": initResp.UploadID,
-			"key":      initResp.Key,
-		})
-	}, nil)
-
+		req.SetBody(payload)
+	}, &completeResp)
 	if err != nil {
+		d.abortMultipart(initResp.UploadID, initResp.Key)
 		return nil, err
 	}
-
-	// Final complete with SHA256 hash
-	_, err = d.request(baseURL+"/upload/complete", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(base.Json{
-			"key":      initResp.Key,
-			"filename": fileName,
-			"path":     dirPath,
-			"size":     fileSize,
-			"hash":     hashStr,
-		})
-	}, nil)
-
-	if err != nil {
-		return nil, err
-	}
-
 	up(100)
-
-	return &model.Object{
-		Name: fileName,
-		Size: fileSize,
-		Path: dirPath + "/" + fileName,
-	}, nil
+	return uploadedObject(fileName, dirPath, fileSize, completeResp), nil
 }
 
+func (d *EdgeCOS) initMultipart(fileName, dirPath string, fileSize int64, hashValue string, overwrite, skipInstant bool) (MultipartInitResp, error) {
+	payload := uploadInitPayload(fileName, dirPath, fileSize, hashValue, overwrite)
+	if skipInstant {
+		payload["skipInstant"] = true
+	}
+	var initResp MultipartInitResp
+	_, err := d.request(baseURL+"/upload/multipart/init", http.MethodPost, func(req *resty.Request) {
+		req.SetBody(payload)
+	}, &initResp)
+	return initResp, err
+}
+
+func (d *EdgeCOS) getMultipartURL(uploadID, key string, partNumber int) (string, error) {
+	var urlsResp MultipartURLsResp
+	_, err := d.request(baseURL+"/upload/multipart/urls", http.MethodPost, func(req *resty.Request) {
+		req.SetBody(base.Json{
+			"uploadId":    uploadID,
+			"key":         key,
+			"partNumbers": []int{partNumber},
+		})
+	}, &urlsResp)
+	if err != nil {
+		return "", err
+	}
+	partURL := urlsResp.URLs[strconv.Itoa(partNumber)]
+	if partURL == "" {
+		return "", fmt.Errorf("missing upload URL for part %d", partNumber)
+	}
+	return partURL, nil
+}
+
+func (d *EdgeCOS) abortMultipart(uploadID, key string) {
+	_, _ = d.request(baseURL+"/upload/multipart/abort", http.MethodPost, func(req *resty.Request) {
+		req.SetBody(base.Json{"uploadId": uploadID, "key": key})
+	}, nil)
+}
+
+func executeUploadRequest(req *http.Request) error {
+	resp, err := base.HttpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+}
+
+func uploadedObject(fileName, dirPath string, fileSize int64, complete UploadCompleteResp) model.Obj {
+	return &model.Object{
+		ID:   complete.ID,
+		Name: fileName,
+		Size: fileSize,
+		Path: normalizePath(path.Join(dirPath, fileName)),
+	}
+}
+
+func cloneJSON(source base.Json) base.Json {
+	cloned := make(base.Json, len(source)+2)
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
 func (d *EdgeCOS) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
-	var myPlan MyPlan
-	_, err := d.request(baseURL+"/my-plan", http.MethodGet, nil, &myPlan)
+	var quota QuotaResp
+	_, err := d.request(baseURL+"/user/quota", http.MethodGet, nil, &quota)
 	if err != nil {
 		return nil, err
 	}
-
-	total, err := strconv.ParseInt(myPlan.Quota, 10, 64)
+	total, err := strconv.ParseInt(quota.Quota, 10, 64)
 	if err != nil {
 		return nil, err
 	}
-
-	used, err := strconv.ParseInt(myPlan.Used, 10, 64)
+	used, err := strconv.ParseInt(quota.Used, 10, 64)
 	if err != nil {
 		return nil, err
 	}
-
 	return &model.StorageDetails{
-		DiskUsage: model.DiskUsage{
-			TotalSpace: total,
-			UsedSpace:  used,
-		},
+		DiskUsage: model.DiskUsage{TotalSpace: total, UsedSpace: used},
 	}, nil
 }
 
