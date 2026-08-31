@@ -190,8 +190,8 @@ func (d *EdgeCOS) downloadURL(file model.Obj) string {
 	} else {
 		query.Set("path", normalizePath(file.GetPath()))
 	}
-	line := strings.ToLower(strings.TrimSpace(d.DownloadLine))
-	if line != "free" {
+	line := "free"
+	if d.UseCDN {
 		line = "cdn"
 	}
 	query.Set("line", line)
