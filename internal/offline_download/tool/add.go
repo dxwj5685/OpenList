@@ -12,6 +12,7 @@ import (
 	_115_open "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
 	_123 "github.com/OpenListTeam/OpenList/v4/drivers/123"
 	_123_open "github.com/OpenListTeam/OpenList/v4/drivers/123_open"
+	"github.com/OpenListTeam/OpenList/v4/drivers/edgecos"
 	"github.com/OpenListTeam/OpenList/v4/drivers/guangyapan"
 	"github.com/OpenListTeam/OpenList/v4/drivers/pikpak"
 	"github.com/OpenListTeam/OpenList/v4/drivers/thunder"
@@ -168,6 +169,10 @@ func AddURL(ctx context.Context, args *AddURLArgs) (task.TaskExtensionInfo, erro
 		} else {
 			tempDir = filepath.Join(setting.GetStr(conf.ThunderXTempDir), uid)
 		}
+	case "EdgeCOS":
+		if _, ok := storage.(*edgecos.EdgeCOS); ok {
+			tempDir = args.DstDirPath
+		}
 	case "GuangYaPan":
 		if _, ok := storage.(*guangyapan.GuangYaPan); ok {
 			tempDir = args.DstDirPath
@@ -249,6 +254,8 @@ func toolNameForStorage(storage driver.Driver) string {
 		return "Thunder"
 	case *thunderx.ThunderX:
 		return "ThunderX"
+	case *edgecos.EdgeCOS:
+		return "EdgeCOS"
 	case *thunder_browser.ThunderBrowser, *thunder_browser.ThunderBrowserExpert:
 		return "ThunderBrowser"
 	default:

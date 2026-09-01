@@ -1,6 +1,7 @@
 package edgecos
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -22,7 +23,12 @@ const (
 )
 
 func (d *EdgeCOS) request(endpoint string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+	return d.requestContext(context.Background(), endpoint, method, callback, resp)
+}
+
+func (d *EdgeCOS) requestContext(ctx context.Context, endpoint string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
 	req := base.RestyClient.R()
+	req.SetContext(ctx)
 	req.SetHeader("Cookie", fmt.Sprintf("token=%s", d.token))
 
 	if callback != nil {
