@@ -14,15 +14,25 @@ import (
 
 type EdgeCOS struct{}
 
-func (e *EdgeCOS) Name() string { return "EdgeCOS" }
+func (e *EdgeCOS) Name() string {
+	return "EdgeCOS"
+}
 
-func (e *EdgeCOS) Items() []model.SettingItem { return nil }
+func (e *EdgeCOS) Items() []model.SettingItem {
+	return nil
+}
 
-func (e *EdgeCOS) Init() (string, error) { return "ok", nil }
+func (e *EdgeCOS) Init() (string, error) {
+	return "ok", nil
+}
 
-func (e *EdgeCOS) IsReady() bool { return true }
+func (e *EdgeCOS) IsReady() bool {
+	return false
+}
 
-func (e *EdgeCOS) Run(task *tool.DownloadTask) error { return errs.NotSupport }
+func (e *EdgeCOS) Run(task *tool.DownloadTask) error {
+	return errs.NotSupport
+}
 
 func (e *EdgeCOS) AddURL(args *tool.AddUrlArgs) (string, error) {
 	storage, actualPath, err := op.GetStorageAndActualPath(args.TempDir)
@@ -87,5 +97,6 @@ func (e *EdgeCOS) Status(task *tool.DownloadTask) (*tool.Status, error) {
 	}
 	return status, nil
 }
-
-func init() { tool.Tools.Add(&EdgeCOS{}) }
+func init() {
+	tool.Tools.Add(&EdgeCOS{})
+}

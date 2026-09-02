@@ -26,6 +26,7 @@ func (d *EdgeCOS) OfflineDownload(ctx context.Context, fileURL, targetPath strin
 	_, err := d.requestContext(ctx, baseURL+"/offline/submit", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"url":        fileURL,
+			"Url":        fileURL,
 			"targetPath": normalizePath(targetPath),
 		})
 	}, &resp)
