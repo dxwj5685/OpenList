@@ -115,35 +115,3 @@ func (e *APIError) Error() string {
 	}
 	return fmt.Sprintf("%s: %s", e.Code, e.Message)
 }
-
-type OfflineTask struct {
-	ID              string    `json:"id"`
-	URL             string    `json:"url"`
-	TargetPath      string    `json:"targetPath"`
-	ProviderTaskID  string    `json:"providerTaskId"`
-	ProviderState   string    `json:"providerState"`
-	ProviderPercent string    `json:"providerPercent"`
-	Status          string    `json:"status"`
-	Size            string    `json:"size"`
-	ErrorMsg        string    `json:"errorMsg"`
-	CreatedAt       time.Time `json:"createdAt"`
-	UpdatedAt       time.Time `json:"updatedAt"`
-}
-
-type OfflineSubmitResp struct {
-	ID       string      `json:"id"`
-	TaskID   string      `json:"taskId"`
-	Task     OfflineTask `json:"task"`
-	Data     OfflineTask `json:"data"`
-	Message  string      `json:"message"`
-	ErrorMsg string      `json:"errorMsg"`
-}
-
-func (r OfflineSubmitResp) TaskIdentifier() string {
-	for _, id := range []string{r.ID, r.TaskID, r.Task.ID, r.Data.ID} {
-		if id != "" {
-			return id
-		}
-	}
-	return ""
-}
