@@ -76,7 +76,19 @@ func (d *EdgeCOS) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj
 	_, err := d.request(baseURL+"/move", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(transferPayload(srcObj, dstDir))
 	}, nil)
-	return srcObj, err
+	if err != nil {
+		return nil, err
+	}
+	return &model.Object{
+		ID:       srcObj.GetID(),
+		Name:     srcObj.GetName(),
+		Size:     srcObj.GetSize(),
+		Modified: srcObj.ModTime(),
+		Ctime:    srcObj.CreateTime(),
+		IsFolder: srcObj.IsDir(),
+		HashInfo: srcObj.GetHash(),
+		Path:     d.getFullPath(dstDir, srcObj.GetName()),
+	}, nil
 }
 
 func (d *EdgeCOS) Rename(ctx context.Context, srcObj model.Obj, newName string) (model.Obj, error) {
@@ -102,7 +114,7 @@ func (d *EdgeCOS) Copy(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj
 	_, err := d.request(baseURL+"/copy", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(transferPayload(srcObj, dstDir))
 	}, nil)
-	return srcObj, err
+	return nil, err
 }
 
 func (d *EdgeCOS) Remove(ctx context.Context, obj model.Obj) error {
