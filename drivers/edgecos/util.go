@@ -1,6 +1,7 @@
 package edgecos
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/net"
 	"github.com/go-resty/resty/v2"
 )
 
@@ -21,53 +23,115 @@ const (
 	maxUploadFileSize        = 100 * 1024 * 1024 * 1024
 )
 
-func (d *EdgeCOS) request(endpoint string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
-	req := base.RestyClient.R()
-	req.SetHeader("Cookie", fmt.Sprintf("token=%s", d.token))
-
-	if callback != nil {
-		callback(req)
-	}
-	if resp != nil {
-		req.SetResult(resp)
-	}
-
-	var apiErr ErrorResp
-	req.SetError(&apiErr)
-
-	res, err := req.Execute(method, endpoint)
-	if err != nil {
-		return nil, err
-	}
-	if res.IsError() {
-		message := apiErr.Message
-		if message == "" {
-			message = apiErr.Error
+func (d *EdgeCOS) request(ctx context.Context, endpoint string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+	var body []byte
+	err := d.withAuthentication(ctx, func(token string) error {
+		req := base.RestyClient.R().SetContext(ctx)
+		req.SetHeader("Cookie", fmt.Sprintf("token=%s", token))
+		if callback != nil {
+			callback(req)
 		}
-		if message == "" {
-			message = strings.TrimSpace(string(res.Body()))
+		if resp != nil {
+			req.SetResult(resp)
 		}
-		if message == "" {
-			message = res.Status()
+		var apiErr ErrorResp
+		req.SetError(&apiErr)
+		res, err := req.Execute(method, endpoint)
+		if err != nil {
+			return err
 		}
-		return nil, &APIError{
-			StatusCode: res.StatusCode(),
-			Code:       apiErr.Code,
-			Message:    message,
+		if res.IsError() {
+			return responseError(res, apiErr)
 		}
-	}
-
-	return res.Body(), nil
+		body = res.Body()
+		return nil
+	})
+	return body, err
 }
 
-func (d *EdgeCOS) getFiles(dirPath string) ([]File, error) {
+func responseError(res *resty.Response, apiErr ErrorResp) *APIError {
+	message := apiErr.Message
+	if message == "" {
+		message = apiErr.Error
+	}
+	if message == "" {
+		message = strings.TrimSpace(string(res.Body()))
+	}
+	if message == "" {
+		message = res.Status()
+	}
+	return &APIError{StatusCode: res.StatusCode(), Code: apiErr.Code, Message: message}
+}
+
+func (d *EdgeCOS) withAuthentication(ctx context.Context, request func(string) error) error {
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		token := d.sessionToken()
+		err := request(token)
+		if attempt != 0 || !isAuthenticationError(err) {
+			return err
+		}
+		if err := d.refreshSession(ctx, token); err != nil {
+			return fmt.Errorf("edgecos reauthentication failed: %w", err)
+		}
+	}
+}
+
+func isAuthenticationError(err error) bool {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.StatusCode != http.StatusUnauthorized {
+			return false
+		}
+		switch apiErr.Code {
+		case "", "AUTH_REQUIRED", "AUTH_EXPIRED", "AUTH_INVALID":
+			return true
+		default:
+			return false
+		}
+	}
+	var status net.HttpStatusCodeError
+	return errors.As(err, &status) && status == http.StatusUnauthorized
+}
+
+func (d *EdgeCOS) sessionToken() string {
+	d.tokenMu.RLock()
+	defer d.tokenMu.RUnlock()
+	return d.token
+}
+
+func (d *EdgeCOS) refreshSession(ctx context.Context, rejectedToken string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	result := d.loginGroup.DoChan("login", func() (struct{}, error) {
+		// Another failed request may already have replaced the rejected token.
+		if token := d.sessionToken(); token != "" && token != rejectedToken {
+			return struct{}{}, nil
+		}
+		// A canceled waiter must not cancel authentication for other requests.
+		loginCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), base.DefaultTimeout)
+		defer cancel()
+		return struct{}{}, d.authenticate(loginCtx)
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case result := <-result:
+		return result.Err
+	}
+}
+
+func (d *EdgeCOS) getFiles(ctx context.Context, dirPath string) ([]File, error) {
 	dirPath = normalizePath(dirPath)
 	files := make([]File, 0)
 	offset := 0
 
 	for {
 		var page FileListResp
-		_, err := d.request(baseURL+"/files", http.MethodGet, func(req *resty.Request) {
+		_, err := d.request(ctx, baseURL+"/files", http.MethodGet, func(req *resty.Request) {
 			req.SetQueryParams(map[string]string{
 				"path":   dirPath,
 				"limit":  strconv.Itoa(fileListPageSize),
@@ -125,8 +189,12 @@ func fileToObj(f File) model.Obj {
 	}
 }
 
-func (d *EdgeCOS) login() error {
-	req := base.RestyClient.R()
+func (d *EdgeCOS) login(ctx context.Context) error {
+	return d.refreshSession(ctx, d.sessionToken())
+}
+
+func (d *EdgeCOS) authenticate(ctx context.Context) error {
+	req := base.RestyClient.R().SetContext(ctx)
 	req.SetBody(base.Json{
 		"username": d.Username,
 		"password": d.Password,
@@ -143,25 +211,22 @@ func (d *EdgeCOS) login() error {
 		return err
 	}
 	if res.IsError() {
-		message := apiErr.Message
-		if message == "" {
-			message = apiErr.Error
-		}
-		if message == "" {
-			message = res.Status()
-		}
-		return errors.New(message)
+		return responseError(res, apiErr)
 	}
 
+	var token string
 	for _, cookie := range res.Cookies() {
 		if cookie.Name == "token" {
-			d.token = cookie.Value
+			token = cookie.Value
 			break
 		}
 	}
-	if d.token == "" {
+	if token == "" {
 		return errors.New("failed to get token from login response")
 	}
+	d.tokenMu.Lock()
+	d.token = token
+	d.tokenMu.Unlock()
 
 	return nil
 }

@@ -16,6 +16,9 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
+	"github.com/OpenListTeam/OpenList/v4/pkg/singleflight"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/go-resty/resty/v2"
 )
@@ -23,7 +26,9 @@ import (
 type EdgeCOS struct {
 	model.Storage
 	Addition
-	token string
+	tokenMu    sync.RWMutex
+	token      string
+	loginGroup singleflight.Group[struct{}]
 }
 
 func (d *EdgeCOS) Config() driver.Config {
@@ -35,7 +40,7 @@ func (d *EdgeCOS) GetAddition() driver.Additional {
 }
 
 func (d *EdgeCOS) Init(ctx context.Context) error {
-	return d.login()
+	return d.login(ctx)
 }
 
 func (d *EdgeCOS) Drop(ctx context.Context) error {
@@ -43,7 +48,7 @@ func (d *EdgeCOS) Drop(ctx context.Context) error {
 }
 
 func (d *EdgeCOS) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
-	files, err := d.getFiles(dir.GetPath())
+	files, err := d.getFiles(ctx, dir.GetPath())
 	if err != nil {
 		return nil, err
 	}
@@ -53,17 +58,36 @@ func (d *EdgeCOS) List(ctx context.Context, dir model.Obj, args model.ListArgs) 
 }
 
 func (d *EdgeCOS) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	downloadURL, size := d.downloadURL(file), file.GetSize()
 	return &model.Link{
-		URL: d.downloadURL(file),
+		URL: downloadURL,
 		Header: http.Header{
-			"Cookie": []string{fmt.Sprintf("token=%s", d.token)},
+			"Cookie": []string{fmt.Sprintf("token=%s", d.sessionToken())},
 		},
+		// Resolve the cookie at read time, including when OpenList reuses this link.
+		RangeReader: stream.RangeReaderFunc(func(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
+			var body io.ReadCloser
+			err := d.withAuthentication(ctx, func(token string) error {
+				reader, err := stream.GetRangeReaderFromLink(size, &model.Link{
+					URL: downloadURL,
+					Header: http.Header{
+						"Cookie": []string{fmt.Sprintf("token=%s", token)},
+					},
+				})
+				if err != nil {
+					return err
+				}
+				body, err = reader.RangeRead(ctx, httpRange)
+				return err
+			})
+			return body, err
+		}),
 	}, nil
 }
 
 func (d *EdgeCOS) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
 	fullPath := d.getFullPath(parentDir, dirName)
-	_, err := d.request(baseURL+"/mkdir", http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(ctx, baseURL+"/mkdir", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{"path": fullPath})
 	}, nil)
 	if err != nil {
@@ -73,7 +97,7 @@ func (d *EdgeCOS) MakeDir(ctx context.Context, parentDir model.Obj, dirName stri
 }
 
 func (d *EdgeCOS) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
-	_, err := d.request(baseURL+"/move", http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(ctx, baseURL+"/move", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(transferPayload(srcObj, dstDir))
 	}, nil)
 	if err != nil {
@@ -94,7 +118,7 @@ func (d *EdgeCOS) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj
 func (d *EdgeCOS) Rename(ctx context.Context, srcObj model.Obj, newName string) (model.Obj, error) {
 	payload := objectPayload(srcObj, "id", "oldPath")
 	payload["newName"] = newName
-	_, err := d.request(baseURL+"/rename", http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(ctx, baseURL+"/rename", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(payload)
 	}, nil)
 	if err != nil {
@@ -111,14 +135,14 @@ func (d *EdgeCOS) Rename(ctx context.Context, srcObj model.Obj, newName string) 
 }
 
 func (d *EdgeCOS) Copy(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
-	_, err := d.request(baseURL+"/copy", http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(ctx, baseURL+"/copy", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(transferPayload(srcObj, dstDir))
 	}, nil)
 	return nil, err
 }
 
 func (d *EdgeCOS) Remove(ctx context.Context, obj model.Obj) error {
-	_, err := d.request(baseURL+"/delete", http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(ctx, baseURL+"/delete", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(objectPayload(obj, "id", "path"))
 	}, nil)
 	return err
@@ -167,12 +191,12 @@ func cacheAndHash(streamer model.FileStreamer, fileSize int64) (model.File, stri
 
 func (d *EdgeCOS) putSmallFile(ctx context.Context, dirPath, fileName string, fileSize int64, hashValue string, overwrite bool, mimeType string, cachedFile model.File, up driver.UpdateProgress) (model.Obj, error) {
 	metadata := uploadMetadata(fileName, dirPath, fileSize, hashValue, overwrite)
-	tokenResp, err := d.getUploadToken(fileName, dirPath, fileSize, hashValue, overwrite, false)
+	tokenResp, err := d.getUploadToken(ctx, fileName, dirPath, fileSize, hashValue, overwrite, false)
 	if err != nil {
 		return nil, err
 	}
 	if tokenResp.IsInstant() {
-		completeResp, completeErr := d.completeInstant(tokenResp.Key, metadata)
+		completeResp, completeErr := d.completeInstant(ctx, tokenResp.Key, metadata)
 		if completeErr == nil {
 			up(100)
 			return uploadedObject(fileName, dirPath, fileSize, completeResp), nil
@@ -180,7 +204,7 @@ func (d *EdgeCOS) putSmallFile(ctx context.Context, dirPath, fileName string, fi
 		if !isInstantMiss(completeErr) {
 			return nil, completeErr
 		}
-		tokenResp, err = d.getUploadToken(fileName, dirPath, fileSize, hashValue, overwrite, true)
+		tokenResp, err = d.getUploadToken(ctx, fileName, dirPath, fileSize, hashValue, overwrite, true)
 		if err != nil {
 			return nil, err
 		}
@@ -211,7 +235,7 @@ func (d *EdgeCOS) putSmallFile(ctx context.Context, dirPath, fileName string, fi
 
 	metadata["key"] = tokenResp.Key
 	var completeResp UploadCompleteResp
-	_, err = d.request(baseURL+"/upload/complete", http.MethodPost, func(req *resty.Request) {
+	_, err = d.request(ctx, baseURL+"/upload/complete", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(metadata)
 	}, &completeResp)
 	if err != nil {
@@ -221,7 +245,7 @@ func (d *EdgeCOS) putSmallFile(ctx context.Context, dirPath, fileName string, fi
 	return uploadedObject(fileName, dirPath, fileSize, completeResp), nil
 }
 
-func (d *EdgeCOS) getUploadToken(fileName, dirPath string, fileSize int64, hashValue string, overwrite, skipInstant bool) (UploadTokenResp, error) {
+func (d *EdgeCOS) getUploadToken(ctx context.Context, fileName, dirPath string, fileSize int64, hashValue string, overwrite, skipInstant bool) (UploadTokenResp, error) {
 	params := map[string]string{
 		"filename":  fileName,
 		"filesize":  strconv.FormatInt(fileSize, 10),
@@ -233,17 +257,17 @@ func (d *EdgeCOS) getUploadToken(fileName, dirPath string, fileSize int64, hashV
 		params["skipInstant"] = "true"
 	}
 	var tokenResp UploadTokenResp
-	_, err := d.request(baseURL+"/upload/token", http.MethodGet, func(req *resty.Request) {
+	_, err := d.request(ctx, baseURL+"/upload/token", http.MethodGet, func(req *resty.Request) {
 		req.SetQueryParams(params)
 	}, &tokenResp)
 	return tokenResp, err
 }
 
-func (d *EdgeCOS) completeInstant(key string, metadata base.Json) (UploadCompleteResp, error) {
+func (d *EdgeCOS) completeInstant(ctx context.Context, key string, metadata base.Json) (UploadCompleteResp, error) {
 	payload := cloneJSON(metadata)
 	payload["key"] = key
 	var completeResp UploadCompleteResp
-	_, err := d.request(baseURL+"/upload/instant-complete", http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(ctx, baseURL+"/upload/instant-complete", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(payload)
 	}, &completeResp)
 	return completeResp, err
@@ -251,12 +275,12 @@ func (d *EdgeCOS) completeInstant(key string, metadata base.Json) (UploadComplet
 
 func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fileSize int64, hashValue string, overwrite bool, cachedFile model.File, up driver.UpdateProgress) (model.Obj, error) {
 	metadata := uploadMetadata(fileName, dirPath, fileSize, hashValue, overwrite)
-	initResp, err := d.initMultipart(fileName, dirPath, fileSize, hashValue, overwrite, false)
+	initResp, err := d.initMultipart(ctx, fileName, dirPath, fileSize, hashValue, overwrite, false)
 	if err != nil {
 		return nil, err
 	}
 	if initResp.IsInstant() {
-		completeResp, completeErr := d.completeInstant(initResp.Key, metadata)
+		completeResp, completeErr := d.completeInstant(ctx, initResp.Key, metadata)
 		if completeErr == nil {
 			up(100)
 			return uploadedObject(fileName, dirPath, fileSize, completeResp), nil
@@ -264,7 +288,7 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 		if !isInstantMiss(completeErr) {
 			return nil, completeErr
 		}
-		initResp, err = d.initMultipart(fileName, dirPath, fileSize, hashValue, overwrite, true)
+		initResp, err = d.initMultipart(ctx, fileName, dirPath, fileSize, hashValue, overwrite, true)
 		if err != nil {
 			return nil, err
 		}
@@ -303,7 +327,7 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 					errCh <- ctx.Err()
 					return
 				}
-				partURL, err := d.getMultipartURL(initResp.UploadID, initResp.Key, task.number)
+				partURL, err := d.getMultipartURL(ctx, initResp.UploadID, initResp.Key, task.number)
 				if err != nil {
 					errCh <- err
 					return
@@ -341,7 +365,7 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 	close(errCh)
 
 	for uploadErr := range errCh {
-		d.abortMultipart(initResp.UploadID, initResp.Key)
+		d.abortMultipart(ctx, initResp.UploadID, initResp.Key)
 		return nil, uploadErr
 	}
 
@@ -349,32 +373,32 @@ func (d *EdgeCOS) putLargeFile(ctx context.Context, dirPath, fileName string, fi
 	payload["uploadId"] = initResp.UploadID
 	payload["key"] = initResp.Key
 	var completeResp UploadCompleteResp
-	_, err = d.request(baseURL+"/upload/multipart/complete", http.MethodPost, func(req *resty.Request) {
+	_, err = d.request(ctx, baseURL+"/upload/multipart/complete", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(payload)
 	}, &completeResp)
 	if err != nil {
-		d.abortMultipart(initResp.UploadID, initResp.Key)
+		d.abortMultipart(ctx, initResp.UploadID, initResp.Key)
 		return nil, err
 	}
 	up(100)
 	return uploadedObject(fileName, dirPath, fileSize, completeResp), nil
 }
 
-func (d *EdgeCOS) initMultipart(fileName, dirPath string, fileSize int64, hashValue string, overwrite, skipInstant bool) (MultipartInitResp, error) {
+func (d *EdgeCOS) initMultipart(ctx context.Context, fileName, dirPath string, fileSize int64, hashValue string, overwrite, skipInstant bool) (MultipartInitResp, error) {
 	payload := uploadInitPayload(fileName, dirPath, fileSize, hashValue, overwrite)
 	if skipInstant {
 		payload["skipInstant"] = true
 	}
 	var initResp MultipartInitResp
-	_, err := d.request(baseURL+"/upload/multipart/init", http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(ctx, baseURL+"/upload/multipart/init", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(payload)
 	}, &initResp)
 	return initResp, err
 }
 
-func (d *EdgeCOS) getMultipartURL(uploadID, key string, partNumber int) (string, error) {
+func (d *EdgeCOS) getMultipartURL(ctx context.Context, uploadID, key string, partNumber int) (string, error) {
 	var urlsResp MultipartURLsResp
-	_, err := d.request(baseURL+"/upload/multipart/urls", http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(ctx, baseURL+"/upload/multipart/urls", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"uploadId":    uploadID,
 			"key":         key,
@@ -391,8 +415,10 @@ func (d *EdgeCOS) getMultipartURL(uploadID, key string, partNumber int) (string,
 	return partURL, nil
 }
 
-func (d *EdgeCOS) abortMultipart(uploadID, key string) {
-	_, _ = d.request(baseURL+"/upload/multipart/abort", http.MethodPost, func(req *resty.Request) {
+func (d *EdgeCOS) abortMultipart(ctx context.Context, uploadID, key string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), base.DefaultTimeout)
+	defer cancel()
+	_, _ = d.request(ctx, baseURL+"/upload/multipart/abort", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{"uploadId": uploadID, "key": key})
 	}, nil)
 }
@@ -428,7 +454,7 @@ func cloneJSON(source base.Json) base.Json {
 }
 func (d *EdgeCOS) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
 	var quota QuotaResp
-	_, err := d.request(baseURL+"/user/quota", http.MethodGet, nil, &quota)
+	_, err := d.request(ctx, baseURL+"/user/quota", http.MethodGet, nil, &quota)
 	if err != nil {
 		return nil, err
 	}
